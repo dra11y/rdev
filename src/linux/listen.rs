@@ -1,6 +1,7 @@
 extern crate libc;
 extern crate x11;
-use crate::linux::common::{convert, FALSE, KEYBOARD};
+
+use crate::linux::common::{convert, FALSE};
 use crate::linux::keyboard::Keyboard;
 use crate::rdev::{Event, ListenError};
 use std::convert::TryInto;
@@ -10,66 +11,89 @@ use std::ptr::null;
 use x11::xlib;
 use x11::xrecord;
 
-static mut RECORD_ALL_CLIENTS: c_ulong = xrecord::XRecordAllClients;
-static mut GLOBAL_CALLBACK: Option<Box<dyn FnMut(Event)>> = None;
+struct Recorder {
+    keyboard: Option<Keyboard>,
+    callback: Box<dyn FnMut(Event)>,
+    record_all_clients: c_ulong,
+}
+
+impl Recorder {
+    fn new<T>(callback: T) -> Result<Self, ListenError>
+    where
+        T: FnMut(Event) + 'static,
+    {
+        let keyboard = Keyboard::new().ok_or(ListenError::KeyboardError)?;
+
+        Ok(Self {
+            keyboard: Some(keyboard),
+            callback: Box::new(callback),
+            record_all_clients: xrecord::XRecordAllClients,
+        })
+    }
+}
 
 pub fn listen<T>(callback: T) -> Result<(), ListenError>
 where
     T: FnMut(Event) + 'static,
 {
-    let keyboard = Keyboard::new().ok_or(ListenError::KeyboardError)?;
+    let mut recorder = Recorder::new(callback)?;
 
-    unsafe {
-        KEYBOARD = Some(keyboard);
-        GLOBAL_CALLBACK = Some(Box::new(callback));
-        // Open displays
-        let dpy_control = xlib::XOpenDisplay(null());
-        if dpy_control.is_null() {
-            return Err(ListenError::MissingDisplayError);
-        }
-        let extension_name = CStr::from_bytes_with_nul(b"RECORD\0")
-            .map_err(|_| ListenError::XRecordExtensionError)?;
-        let extension = xlib::XInitExtension(dpy_control, extension_name.as_ptr());
-        if extension.is_null() {
-            return Err(ListenError::XRecordExtensionError);
-        }
+    // Open displays
+    let dpy_control = unsafe { xlib::XOpenDisplay(null()) };
+    if dpy_control.is_null() {
+        return Err(ListenError::MissingDisplayError);
+    }
 
-        // Prepare record range
-        let mut record_range: xrecord::XRecordRange = *xrecord::XRecordAllocRange();
-        record_range.device_events.first = xlib::KeyPress as c_uchar;
-        record_range.device_events.last = xlib::MotionNotify as c_uchar;
+    let extension_name =
+        CStr::from_bytes_with_nul(b"RECORD\0").map_err(|_| ListenError::XRecordExtensionError)?;
+    let extension = unsafe { xlib::XInitExtension(dpy_control, extension_name.as_ptr()) };
+    if extension.is_null() {
+        return Err(ListenError::XRecordExtensionError);
+    }
 
-        // Create context
-        let context = xrecord::XRecordCreateContext(
+    // Prepare record range
+    let mut record_range: xrecord::XRecordRange = unsafe { *xrecord::XRecordAllocRange() };
+    record_range.device_events.first = xlib::KeyPress as c_uchar;
+    record_range.device_events.last = xlib::MotionNotify as c_uchar;
+
+    let mut record_range_ptr: *mut xrecord::XRecordRange = &mut record_range;
+    let record_range_ptr_ptr: *mut *mut xrecord::XRecordRange = &mut record_range_ptr;
+
+    // Create context
+    let context = unsafe {
+        xrecord::XRecordCreateContext(
             dpy_control,
             0,
-            &mut RECORD_ALL_CLIENTS,
+            &mut recorder.record_all_clients as *mut c_ulong,
             1,
-            &mut &mut record_range as *mut &mut xrecord::XRecordRange
-                as *mut *mut xrecord::XRecordRange,
+            record_range_ptr_ptr,
             1,
-        );
+        )
+    };
 
-        if context == 0 {
-            return Err(ListenError::RecordContextError);
-        }
-
-        xlib::XSync(dpy_control, FALSE);
-        // Run
-        let result =
-            xrecord::XRecordEnableContext(dpy_control, context, Some(record_callback), &mut 0);
-        if result == 0 {
-            return Err(ListenError::RecordContextEnablingError);
-        }
+    if context == 0 {
+        return Err(ListenError::RecordContextError);
     }
+
+    unsafe { xlib::XSync(dpy_control, FALSE) };
+
+    // Run
+    let result = unsafe {
+        xrecord::XRecordEnableContext(
+            dpy_control,
+            context,
+            Some(record_callback),
+            &mut recorder as *mut Recorder as *mut _,
+        )
+    };
+
+    if result == 0 {
+        return Err(ListenError::RecordContextEnablingError);
+    }
+
     Ok(())
 }
 
-// No idea how to do that properly relevant doc lives here:
-// https://www.x.org/releases/X11R7.7/doc/libXtst/recordlib.html#Datum_Flags
-// https://docs.rs/xproto/1.1.5/xproto/struct._xEvent__bindgen_ty_1.html
-// 0.4.2: xproto was removed for some reason and contained the real structs
-// but we can't use it anymore.
 #[repr(C)]
 struct XRecordDatum {
     type_: u8,
@@ -105,10 +129,10 @@ unsafe extern "C" fn record_callback(
     let x = xdatum.root_x as f64;
     let y = xdatum.root_y as f64;
 
-    if let Some(event) = convert(&mut KEYBOARD, code, type_, x, y) {
-        if let Some(callback) = &mut GLOBAL_CALLBACK {
-            callback(event);
-        }
+    let recorder = &mut *(raw_data as *mut Recorder);
+
+    if let Some(event) = convert(&mut recorder.keyboard, code, type_, x, y) {
+        (recorder.callback)(event);
     }
     xrecord::XRecordFreeData(raw_data);
 }
