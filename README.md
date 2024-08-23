@@ -1,16 +1,19 @@
-![](https://github.com/Narsil/rdev/workflows/build/badge.svg)
-[![Crate](https://img.shields.io/crates/v/rdev.svg)](https://crates.io/crates/rdev)
-[![API](https://docs.rs/rdev/badge.svg)](https://docs.rs/rdev)
+![](https://github.com/dra11y/better-rdev/workflows/build/badge.svg)
+[![Crate](https://img.shields.io/crates/v/better-rdev.svg)](https://crates.io/crates/better-rdev)
+[![API](https://docs.rs/better-rdev/badge.svg)](https://docs.rs/better-rdev)
 
-# rdev
+# better-rdev
 
-Simple library to listen and send events **globally** to keyboard and mouse on macOS, Windows and Linux
-(x11).
+Simple library to listen and send events **globally** to keyboard and mouse on macOS, Windows and Linux (x11 **and** Wayland).
 
-You can also check out [Enigo](https://github.com/Enigo-rs/Enigo) which is another
-crate which helped me write this one.
+The goals of this fork are:
+1. Eliminate major bugs in `rdev` such as stuck control keys on suspend/resume or login events that prevent even the login screen from working, forcing us to reboot;
+2. Eliminate all global variables and other discouraged practices;
+3. Get touchpad events working;
+4. Allow cancelling listen/grab;
+5. Get these fixes from Linux into the other platforms.
 
-This crate is so far a pet project for me to understand the Rust ecosystem.
+# Rest of Original README
 
 ## Listening to global events
 

@@ -244,6 +244,8 @@ pub use crate::windows::Keyboard;
 #[cfg(target_os = "windows")]
 use crate::windows::{display_size as _display_size, listen as _listen, simulate as _simulate};
 
+use std::sync::{atomic::AtomicBool, Arc};
+
 /// Listening to global events. Caveat: On MacOS, you require the listen
 /// loop needs to be the primary app (no fork before) and need to have accessibility
 /// settings enabled.
@@ -357,11 +359,11 @@ pub use crate::windows::grab as _grab;
 /// }
 /// ```
 #[cfg(feature = "unstable_grab")]
-pub fn grab<T>(callback: T) -> Result<(), GrabError>
+pub fn grab<T>(callback: T, cancel_flag: Arc<AtomicBool>) -> Result<(), GrabError>
 where
     T: Fn(Event) -> Option<Event> + 'static,
 {
-    _grab(callback)
+    _grab(callback, cancel_flag)
 }
 
 #[cfg(test)]

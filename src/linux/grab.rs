@@ -13,9 +13,13 @@ use std::io;
 use std::os::unix::{
     ffi::OsStrExt,
     fs::FileTypeExt,
-    io::{AsRawFd, IntoRawFd, RawFd},
+    io::{AsRawFd, RawFd},
 };
 use std::path::Path;
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
 use std::time::SystemTime;
 
 // TODO The x, y coordinates are currently wrong !! Is there mouse acceleration
@@ -301,7 +305,7 @@ fn evdev_event_to_rdev_event(
 //     }
 // }
 
-pub fn grab<T>(callback: T) -> Result<(), GrabError>
+pub fn grab<T>(callback: T, cancel_flag: Arc<AtomicBool>) -> Result<(), GrabError>
 where
     T: Fn(Event) -> Option<Event> + 'static,
 {
@@ -315,29 +319,32 @@ where
     let mut y = current_y as f64;
     let w = width as f64;
     let h = height as f64;
-    filter_map_events(|event| {
-        let event_type = match evdev_event_to_rdev_event(&event, &mut x, &mut y, w, h) {
-            Some(rdev_event) => rdev_event,
-            // If we can't convert event, simulate it
-            None => return (Some(event), GrabStatus::Continue),
-        };
-        let name = kb.add(&event_type);
-        let rdev_event = Event {
-            time: SystemTime::now(),
-            name,
-            event_type,
-        };
-        if callback(rdev_event).is_some() {
-            (Some(event), GrabStatus::Continue)
-        } else {
-            // callback returns None, swallow the event
-            (None, GrabStatus::Continue)
-        }
-    })?;
+    filter_map_events(
+        |event| {
+            let event_type = match evdev_event_to_rdev_event(&event, &mut x, &mut y, w, h) {
+                Some(rdev_event) => rdev_event,
+                // If we can't convert event, simulate it
+                None => return (Some(event), GrabStatus::Continue),
+            };
+            let name = kb.add(&event_type);
+            let rdev_event = Event {
+                time: SystemTime::now(),
+                name,
+                event_type,
+            };
+            if callback(rdev_event).is_some() {
+                (Some(event), GrabStatus::Continue)
+            } else {
+                // callback returns None, swallow the event
+                (None, GrabStatus::Continue)
+            }
+        },
+        cancel_flag,
+    )?;
     Ok(())
 }
 
-pub fn filter_map_events<F>(mut func: F) -> io::Result<()>
+pub fn filter_map_events<F>(mut func: F, cancel_flag: Arc<AtomicBool>) -> io::Result<()>
 where
     F: FnMut(InputEvent) -> (Option<InputEvent>, GrabStatus),
 {
@@ -353,10 +360,18 @@ where
     let mut epoll_buffer = [epoll::Event::new(epoll::Events::empty(), 0); 4];
     let mut inotify_buffer = vec![0_u8; 4096];
     'event_loop: loop {
+        if cancel_flag.load(Ordering::SeqCst) {
+            break 'event_loop;
+        }
+
         let num_events = epoll::wait(epoll_fd, -1, &mut epoll_buffer)?;
 
         //map and simulate events, dealing with
         'events: for event in &epoll_buffer[0..num_events] {
+            if cancel_flag.load(Ordering::SeqCst) {
+                break 'event_loop;
+            }
+
             // new device file created
             if event.data == INOTIFY_DATA {
                 for event in inotify.read_events(&mut inotify_buffer)? {
@@ -375,7 +390,7 @@ where
                     let (_, event) = match device.next_event(evdev_rs::ReadFlag::NORMAL) {
                         Ok(event) => event,
                         Err(_) => {
-                            let device_fd = device.fd().unwrap().into_raw_fd();
+                            let device_fd = device.file().as_raw_fd();
                             let empty_event = epoll::Event::new(epoll::Events::empty(), 0);
                             epoll::ctl(epoll_fd, EPOLL_CTL_DEL, device_fd, empty_event)?;
                             continue 'events;
@@ -469,8 +484,8 @@ where
 }
 
 fn inotify_devices() -> io::Result<Inotify> {
-    let mut inotify = Inotify::init()?;
-    inotify.add_watch(DEV_PATH, WatchMask::CREATE)?;
+    let inotify = Inotify::init()?;
+    inotify.watches().add(DEV_PATH, WatchMask::CREATE)?;
     Ok(inotify)
 }
 
@@ -485,7 +500,7 @@ fn add_device_to_epoll_from_inotify_event(
     // new plug events
     let file = File::open(device_path)?;
     let fd = file.as_raw_fd();
-    let device = Device::new_from_fd(file)?;
+    let device = Device::new_from_file(file)?;
     let event = epoll::Event::new(EPOLLIN, devices.len() as u64);
     devices.push(device);
     epoll::ctl(epoll_fd, EPOLL_CTL_ADD, fd, event)?;
@@ -501,7 +516,7 @@ fn setup_devices() -> io::Result<(RawFd, Vec<Device>, Vec<UInputDevice>)> {
     let epoll_fd = epoll_watch_all(device_files.iter())?;
     let devices = device_files
         .into_iter()
-        .map(Device::new_from_fd)
+        .map(Device::new_from_file)
         .collect::<io::Result<Vec<Device>>>()?;
     let output_devices = devices
         .iter()
