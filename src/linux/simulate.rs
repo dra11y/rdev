@@ -69,6 +69,7 @@ unsafe fn send_native(event_type: &EventType, display: *mut xlib::Display) -> Op
             }
             result
         }
+        EventType::Touch(touch_event) => todo!("EventType::TouchPad(Touch)"),
     };
     if res == 0 {
         None

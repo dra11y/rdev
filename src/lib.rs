@@ -219,8 +219,8 @@
 //! Serde if you install this library with the `serialize` feature.
 mod rdev;
 pub use crate::rdev::{
-    Button, DisplayError, Event, EventType, GrabCallback, GrabError, Key, KeyboardState,
-    ListenError, SimulateError,
+    Button, Direction, DisplayError, Event, EventType, Gesture, GrabCallback, GrabError, Key,
+    KeyboardState, ListenError, SimulateError,
 };
 
 #[cfg(target_os = "macos")]
@@ -325,13 +325,16 @@ pub fn display_size() -> Result<(u64, u64), DisplayError> {
 
 #[cfg(feature = "unstable_grab")]
 #[cfg(target_os = "linux")]
-pub use crate::linux::grab as _grab;
-#[cfg(feature = "unstable_grab")]
-#[cfg(target_os = "macos")]
-pub use crate::macos::grab as _grab;
+pub use crate::linux::grab::{grab as _grab, GrabReturn, GrabStatus};
 #[cfg(feature = "unstable_grab")]
 #[cfg(target_os = "windows")]
 pub use crate::windows::grab as _grab;
+#[cfg(feature = "unstable_grab")]
+#[cfg(target_os = "macos")]
+pub use evdev_rs::Device;
+#[cfg(feature = "unstable_grab")]
+#[cfg(target_os = "linux")]
+pub use evdev_rs::Device;
 #[cfg(feature = "unstable_grab")]
 /// Grabbing global events. In the callback, returning None ignores the event
 /// and returning the event let's it pass. There is no modification of the event
@@ -361,7 +364,7 @@ pub use crate::windows::grab as _grab;
 #[cfg(feature = "unstable_grab")]
 pub fn grab<T>(callback: T, cancel_flag: Arc<AtomicBool>) -> Result<(), GrabError>
 where
-    T: Fn(Event) -> Option<Event> + 'static,
+    T: Fn(Event, &Device) -> GrabReturn + 'static,
 {
     _grab(callback, cancel_flag)
 }

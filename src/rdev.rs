@@ -101,7 +101,8 @@ impl std::error::Error for SimulateError {}
 #[cfg_attr(feature = "serialize", derive(Serialize, Deserialize))]
 pub enum Key {
     /// Alt key on Linux and Windows (option key on macOS)
-    Alt,
+    AltLeft,
+    AltRight,
     AltGr,
     Backspace,
     CapsLock,
@@ -223,6 +224,63 @@ pub enum Button {
     Unknown(u8),
 }
 
+// #[derive(Debug, Copy, Clone, PartialEq)]
+// pub enum TouchEvent {
+//     Slot(i32),
+//     TouchActive(bool),
+//     TrackingId(i32),
+//     X(i32),
+//     Y(i32),
+//     AbsX(i32),
+//     AbsY(i32),
+//     /// FingerCount(count) corresponds to BTN_TOOL_* as follows:
+//     /// BTN_TOOL_FINGER = 1
+//     /// BTN_TOOL_DOUBLETAP = 2
+//     /// BTN_TOOL_TRIPLETAP = 3
+//     /// BTN_TOOL_QUADTAP = 4
+//     FingerCount(i32),
+//     ButtonDown(Button),
+//     ButtonUp(Button),
+//     Sync(bool), // frame sync; bool = whether MT (multitouch)
+// }
+
+// Touch Gestures
+
+#[derive(Clone, Copy, Debug, Hash, PartialEq, PartialOrd, Eq, Ord)]
+pub enum Direction {
+    Up,
+    Down,
+    Left,
+    Right,
+}
+
+#[repr(u8)]
+#[derive(Clone, Debug, PartialEq, PartialOrd, Copy, Eq, Ord)]
+pub enum Fingers {
+    One = 1,
+    Two = 2,
+    Three = 3,
+    Four = 4,
+}
+
+/// A result derived from one or more [`SynReport`] instances in a stream.
+#[derive(Clone, Copy, Debug, PartialEq, PartialOrd, Eq, Ord)]
+pub enum Gesture {
+    Tap {
+        fingers: Fingers,
+    },
+    Swipe {
+        fingers: Fingers,
+        direction: Direction,
+    },
+    Scroll {
+        direction: Direction,
+        distance: i32,
+    },
+}
+
+// End Touch Gestures
+
 /// In order to manage different OSs, the current EventType choices are a mix and
 /// match to account for all possible events.
 #[derive(Debug, Copy, Clone, PartialEq)]
@@ -235,6 +293,8 @@ pub enum EventType {
     /// Mouse Button
     ButtonPress(Button),
     ButtonRelease(Button),
+    /// Touch events
+    Touch(Gesture),
     /// Values in pixels. `EventType::MouseMove{x: 0, y: 0}` corresponds to the
     /// top left corner, with x increasing downward and y increasing rightward
     MouseMove {
@@ -251,7 +311,7 @@ pub enum EventType {
 }
 
 /// When events arrive from the OS they get some additional information added from
-/// EventType, which is the time when this event was received, and the name Option
+/// EventType, which is the time when this event was received, and the char Option
 /// which contains what characters should be emmitted from that event. This relies
 /// on the OS layout and keyboard state machinery.
 /// Caveat: Dead keys don't function on Linux(X11) yet. You will receive None for
@@ -260,7 +320,7 @@ pub enum EventType {
 #[cfg_attr(feature = "serialize", derive(Serialize, Deserialize))]
 pub struct Event {
     pub time: SystemTime,
-    pub name: Option<String>,
+    pub char: Option<String>,
     pub event_type: EventType,
 }
 

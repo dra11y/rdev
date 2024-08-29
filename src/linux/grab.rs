@@ -1,29 +1,35 @@
 use crate::linux::common::Display;
+use crate::linux::gestures::TouchEventLoop;
 use crate::linux::keyboard::Keyboard;
 use crate::rdev::{Button, Event, EventType, GrabError, Key, KeyboardState};
 use epoll::ControlOptions::{EPOLL_CTL_ADD, EPOLL_CTL_DEL};
+use evdev_rs::enums::{EV_ABS, EV_MSC, EV_SW, EV_SYN};
 use evdev_rs::{
     enums::{EventCode, EV_KEY, EV_REL},
-    Device, InputEvent, UInputDevice,
+    Device as EVDevice, InputEvent, UInputDevice,
 };
+use evdev_rs::{DeviceWrapper, GrabMode};
 use inotify::{Inotify, WatchMask};
-use std::ffi::{OsStr, OsString};
+use std::collections::HashMap;
+use std::ffi::OsStr;
 use std::fs::{read_dir, File};
-use std::io;
 use std::os::unix::{
     ffi::OsStrExt,
     fs::FileTypeExt,
     io::{AsRawFd, RawFd},
 };
-use std::path::Path;
+use std::path::PathBuf;
+use std::sync::Mutex;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc,
 };
-use std::time::SystemTime;
+use std::thread::sleep;
+use std::time::{Duration, SystemTime};
+use std::{io, thread};
 
-// TODO The x, y coordinates are currently wrong !! Is there mouse acceleration
-// to take into account ??
+/// TODO The x, y coordinates are currently wrong !! Is there mouse acceleration
+/// to take into account ??
 
 macro_rules! convert_keys {
     ($($ev_key:ident, $rdev_key:ident),*) => {
@@ -138,8 +144,9 @@ convert_keys!(
     KEY_DOT, Dot,
     KEY_SLASH, Slash,
     KEY_RIGHTSHIFT, ShiftRight,
-    KEY_KPASTERISK , KpMultiply,
-    KEY_LEFTALT, Alt,
+    KEY_KPASTERISK, KpMultiply,
+    KEY_LEFTALT, AltLeft,
+    KEY_RIGHTALT, AltRight,
     KEY_SPACE, Space,
     KEY_CAPSLOCK, CapsLock,
     KEY_F1, F1,
@@ -172,7 +179,7 @@ convert_keys!(
     KEY_RIGHTCTRL, ControlRight,
     KEY_KPSLASH, KpDivide,
     KEY_RIGHTALT, AltGr,
-    KEY_HOME , Home,
+    KEY_HOME, Home,
     KEY_UP, UpArrow,
     KEY_PAGEUP, PageUp,
     KEY_LEFT, LeftArrow,
@@ -194,68 +201,148 @@ convert_keys!(
 
 fn evdev_event_to_rdev_event(
     event: &InputEvent,
+    device: &Device,
     x: &mut f64,
     y: &mut f64,
     w: f64,
     h: f64,
 ) -> Option<EventType> {
-    match &event.event_code {
-        EventCode::EV_KEY(key) => {
-            if let Some(button) = evdev_key_to_rdev_button(key) {
-                // first check if pressed key is a mouse button
-                match event.value {
-                    0 => Some(EventType::ButtonRelease(button)),
-                    _ => Some(EventType::ButtonPress(button)),
-                }
-            } else if let Some(key) = evdev_key_to_rdev_key(key) {
-                // check if pressed key is a keyboard key
-                match event.value {
+    let event_type = match &device.device_type {
+        DeviceType::Keyboard => match &event.event_code {
+            EventCode::EV_KEY(key) => match evdev_key_to_rdev_key(key) {
+                Some(key) => match event.value {
                     0 => Some(EventType::KeyRelease(key)),
                     _ => Some(EventType::KeyPress(key)),
-                }
-            } else {
-                // if neither mouse button nor keyboard key, return none
-                None
-            }
-        }
-        EventCode::EV_REL(mouse) => match mouse {
-            EV_REL::REL_X => {
-                let dx = event.value as f64;
-                *x += dx;
-                if *x < 0.0 {
-                    *x = 0.0;
-                }
-                if *x > w {
-                    *x = w;
-                }
-                Some(EventType::MouseMove { x: *x, y: *y })
-            }
-            EV_REL::REL_Y => {
-                let dy = event.value as f64;
-                *y += dy;
-                if *y < 0.0 {
-                    *y = 0.0;
-                }
-                if *y > h {
-                    *y = h;
-                }
-                Some(EventType::MouseMove { x: *x, y: *y })
-            }
-            EV_REL::REL_HWHEEL => Some(EventType::Wheel {
-                delta_x: event.value.into(),
-                delta_y: 0,
-            }),
-            EV_REL::REL_WHEEL => Some(EventType::Wheel {
-                delta_x: 0,
-                delta_y: event.value.into(),
-            }),
-            // Other EV_REL events cannot be represented by rdev
+                },
+                None => None,
+            },
             _ => None,
         },
-        // Other event_codes cannot be represented by rdev,
-        // and some never will e.g. EV_SYN
-        _ => None,
+        DeviceType::Mouse => match &event.event_code {
+            EventCode::EV_KEY(button) => match evdev_key_to_rdev_button(button) {
+                Some(button) => match event.value {
+                    0 => Some(EventType::ButtonRelease(button)),
+                    _ => Some(EventType::ButtonPress(button)),
+                },
+                None => None,
+            },
+            EventCode::EV_REL(mouse) => match mouse {
+                EV_REL::REL_X => {
+                    let dx = event.value as f64;
+                    *x += dx;
+                    if *x < 0.0 {
+                        *x = 0.0;
+                    }
+                    if *x > w {
+                        *x = w;
+                    }
+                    Some(EventType::MouseMove { x: *x, y: *y })
+                }
+                EV_REL::REL_Y => {
+                    let dy = event.value as f64;
+                    *y += dy;
+                    if *y < 0.0 {
+                        *y = 0.0;
+                    }
+                    if *y > h {
+                        *y = h;
+                    }
+                    Some(EventType::MouseMove { x: *x, y: *y })
+                }
+                EV_REL::REL_HWHEEL => Some(EventType::Wheel {
+                    delta_x: event.value.into(),
+                    delta_y: 0,
+                }),
+                EV_REL::REL_WHEEL => Some(EventType::Wheel {
+                    delta_x: 0,
+                    delta_y: event.value.into(),
+                }),
+                _ => None,
+            },
+            _ => None,
+        },
+        DeviceType::Touchpad => None,
+        // DeviceType::Touchpad => match &event.event_code {
+        //     EventCode::EV_KEY(key) => match key {
+        //         EV_KEY::BTN_LEFT => match event.value {
+        //             0 => Some(EventType::Touch(TouchEvent::ButtonUp(Button::Left))),
+        //             _ => Some(EventType::Touch(TouchEvent::ButtonDown(Button::Left))),
+        //         },
+        //         EV_KEY::BTN_RIGHT => match event.value {
+        //             0 => Some(EventType::Touch(TouchEvent::ButtonUp(Button::Right))),
+        //             _ => Some(EventType::Touch(TouchEvent::ButtonDown(Button::Right))),
+        //         },
+        //         EV_KEY::BTN_TOOL_FINGER => match event.value {
+        //             0 => Some(EventType::Touch(TouchEvent::FingerCount(0))),
+        //             _ => Some(EventType::Touch(TouchEvent::FingerCount(1))),
+        //         },
+        //         EV_KEY::BTN_TOOL_DOUBLETAP => match event.value {
+        //             0 => Some(EventType::Touch(TouchEvent::FingerCount(0))),
+        //             _ => Some(EventType::Touch(TouchEvent::FingerCount(2))),
+        //         },
+        //         EV_KEY::BTN_TOOL_TRIPLETAP => match event.value {
+        //             0 => Some(EventType::Touch(TouchEvent::FingerCount(0))),
+        //             _ => Some(EventType::Touch(TouchEvent::FingerCount(3))),
+        //         },
+        //         EV_KEY::BTN_TOOL_QUADTAP => match event.value {
+        //             0 => Some(EventType::Touch(TouchEvent::FingerCount(0))),
+        //             _ => Some(EventType::Touch(TouchEvent::FingerCount(4))),
+        //         },
+        //         EV_KEY::BTN_TOUCH => match event.value {
+        //             0 => Some(EventType::Touch(TouchEvent::TouchActive(false))),
+        //             _ => Some(EventType::Touch(TouchEvent::TouchActive(true))),
+        //         },
+        //         _ => None,
+        //     },
+        //     EventCode::EV_SYN(syn) => match syn {
+        //         EV_SYN::SYN_REPORT => Some(EventType::Touch(TouchEvent::Sync(false))),
+        //         EV_SYN::SYN_MT_REPORT => Some(EventType::Touch(TouchEvent::Sync(true))),
+        //         _ => None,
+        //     },
+        //     EventCode::EV_ABS(touchpad) => match touchpad {
+        //         EV_ABS::ABS_X => Some(EventType::Touch(TouchEvent::AbsX(event.value))),
+        //         EV_ABS::ABS_Y => Some(EventType::Touch(TouchEvent::AbsY(event.value))),
+        //         EV_ABS::ABS_MT_TRACKING_ID => {
+        //             Some(EventType::Touch(TouchEvent::TrackingId(event.value)))
+        //         }
+        //         EV_ABS::ABS_MT_SLOT => Some(EventType::Touch(TouchEvent::Slot(event.value))),
+        //         EV_ABS::ABS_MT_POSITION_X => Some(EventType::Touch(TouchEvent::X(event.value))),
+        //         EV_ABS::ABS_MT_POSITION_Y => Some(EventType::Touch(TouchEvent::Y(event.value))),
+        //         _ => {
+        //             println!("TOUCHPAD MISS: {:?}", touchpad);
+        //             None
+        //         }
+        //     },
+        //     _ => None,
+        // },
+        DeviceType::LidSwitch => todo!(),
+    };
+
+    if event_type.is_none() {
+        let print_event = match &event.event_code {
+            EventCode::EV_SYN(_) => false,
+            // EventCode::EV_KEY(_) => false,
+            EventCode::EV_MSC(msc) => match msc {
+                EV_MSC::MSC_SERIAL => false,
+                EV_MSC::MSC_PULSELED => false,
+                EV_MSC::MSC_GESTURE => true,
+                EV_MSC::MSC_RAW => true,
+                EV_MSC::MSC_SCAN => false,
+                EV_MSC::MSC_TIMESTAMP => false,
+                EV_MSC::MSC_MAX => true,
+            },
+            _ => true,
+        };
+
+        // if print_event {
+        //     println!(
+        //         "UNHANDLED EVENT: device_type: {:?}\nevent: {:?}\ndevice: {:?}",
+        //         &device.device_type, &event, &device,
+        //     );
+        // }
     }
+
+    event_type
 }
 
 // fn rdev_event_to_evdev_event(event: &EventType, time: &TimeVal) -> Option<InputEvent> {
@@ -305,9 +392,11 @@ fn evdev_event_to_rdev_event(
 //     }
 // }
 
+pub type GrabReturn = (Option<Event>, GrabStatus);
+
 pub fn grab<T>(callback: T, cancel_flag: Arc<AtomicBool>) -> Result<(), GrabError>
 where
-    T: Fn(Event) -> Option<Event> + 'static,
+    T: Fn(Event, &EVDevice) -> GrabReturn + 'static,
 {
     let mut kb = Keyboard::new().ok_or(GrabError::KeyboardError)?;
     let display = Display::new().ok_or(GrabError::MissingDisplayError)?;
@@ -319,57 +408,137 @@ where
     let mut y = current_y as f64;
     let w = width as f64;
     let h = height as f64;
-    filter_map_events(
-        |event| {
-            let event_type = match evdev_event_to_rdev_event(&event, &mut x, &mut y, w, h) {
-                Some(rdev_event) => rdev_event,
-                // If we can't convert event, simulate it
-                None => return (Some(event), GrabStatus::Continue),
-            };
-            let name = kb.add(&event_type);
+
+    let mut touch_event_loop = Arc::new(Mutex::new(TouchEventLoop::new()));
+
+    filter_map_events(cancel_flag, move |event, device| {
+        let mut touch_event_loop = touch_event_loop
+            .lock()
+            .expect("Failed to lock touch_event_loop Mutex");
+        if let Some(gesture) = touch_event_loop.add_event(event.time, event.event_code, event.value)
+        {
+            // println!("Detected gesture: {:?}, event: {:?}", gesture, event);
             let rdev_event = Event {
                 time: SystemTime::now(),
-                name,
-                event_type,
+                char: None,
+                event_type: EventType::Touch(gesture),
             };
-            if callback(rdev_event).is_some() {
-                (Some(event), GrabStatus::Continue)
-            } else {
-                // callback returns None, swallow the event
-                (None, GrabStatus::Continue)
-            }
-        },
-        cancel_flag,
-    )?;
+            return match callback(rdev_event, &device.ev_device) {
+                (None, grab_status) => (None, grab_status),
+                (Some(_), grab_status) => (Some(event), grab_status),
+            };
+        }
+        let event_type = match evdev_event_to_rdev_event(&event, device, &mut x, &mut y, w, h) {
+            Some(rdev_event) => rdev_event,
+            // If we can't convert event, simulate it
+            None => return (Some(event), GrabStatus::Continue),
+        };
+        let char: Option<String> = kb.add(&event_type);
+        let rdev_event = Event {
+            time: SystemTime::now(),
+            char,
+            event_type,
+        };
+        match callback(rdev_event, &device.ev_device) {
+            (None, grab_status) => (None, grab_status),
+            (Some(_), grab_status) => (Some(event), grab_status),
+        }
+    })?;
     Ok(())
 }
 
-pub fn filter_map_events<F>(mut func: F, cancel_flag: Arc<AtomicBool>) -> io::Result<()>
-where
-    F: FnMut(InputEvent) -> (Option<InputEvent>, GrabStatus),
-{
-    let (epoll_fd, mut devices, output_devices) = setup_devices()?;
-    let mut inotify = setup_inotify(epoll_fd, &devices)?;
+// #[derive(Clone, Copy, Default)]
+// struct Point {
+//     x: i32,
+//     y: i32,
+// }
 
-    //grab devices
-    devices
-        .iter_mut()
-        .try_for_each(|device| device.grab(evdev_rs::GrabMode::Grab))?;
+// #[derive(Clone, Copy, Default)]
+// struct TouchState {
+//     slot: Option<usize>,
+//     down: [bool; 5],
+//     point: [Point; 5],
+// }
+
+// impl TouchState {
+//     fn update(&mut self, slot: Option<usize>, down: Option<bool>, point: Option<Point>) {
+//         if let Some(slot) = slot {
+//             self.slot = Some(slot);
+//         }
+//         let Some(slot) = self.slot else {
+//             return;
+//         };
+//         if let Some(down) = down {
+//             self.down[slot] = down;
+//         }
+//         if let Some(point) = point {
+//             self.point[slot] = point;
+//         }
+//     }
+// }
+
+fn force_release_keys(output_device: &UInputDevice) {
+    println!("force_release_keys output_device: {:?}", output_device);
+
+    sleep(Duration::from_millis(50));
+
+    let keys = [
+        EV_KEY::KEY_LEFTMETA,
+        EV_KEY::KEY_RIGHTMETA,
+        EV_KEY::KEY_LEFTCTRL,
+        EV_KEY::KEY_RIGHTCTRL,
+        EV_KEY::KEY_LEFTALT,
+        EV_KEY::KEY_RIGHTALT,
+        EV_KEY::KEY_LEFTSHIFT,
+        EV_KEY::KEY_RIGHTSHIFT,
+        // Add any other keys that might get stuck
+    ];
+
+    for key in keys.iter() {
+        let event = InputEvent::new(&evdev_rs::TimeVal::new(0, 0), &EventCode::EV_KEY(*key), 0);
+        sleep(Duration::from_millis(50));
+        output_device.write_event(&event).ok();
+        output_device
+            .write_event(&InputEvent::new(
+                &evdev_rs::TimeVal::new(0, 0),
+                &EventCode::EV_SYN(EV_SYN::SYN_REPORT),
+                0,
+            ))
+            .ok();
+    }
+}
+
+pub fn filter_map_events<F>(cancel_flag: Arc<AtomicBool>, mut callback: F) -> io::Result<()>
+where
+    F: FnMut(InputEvent, &Device) -> (Option<InputEvent>, GrabStatus),
+{
+    let (epoll_fd, mut devices) = setup_devices()?;
+
+    // let ev_devices: Vec<EVDevice> = devices.iter().map(|dev| dev.device).collect();
+    // let device_paths: Vec<PathBuf> = devices.iter().map(|dev| dev.path).collect();
+    // let output_devices: Vec<UInputDevice> = devices.iter().map(|dev| dev.output_device).collect();
+
+    for device in &mut devices {
+        device.ev_device.grab(GrabMode::Grab)?;
+    }
+
+    let mut inotify = setup_inotify(epoll_fd, &devices)?;
 
     // create buffer for epoll to fill
     let mut epoll_buffer = [epoll::Event::new(epoll::Events::empty(), 0); 4];
     let mut inotify_buffer = vec![0_u8; 4096];
-    'event_loop: loop {
+
+    'outer_loop: loop {
         if cancel_flag.load(Ordering::SeqCst) {
-            break 'event_loop;
+            break 'outer_loop;
         }
 
         let num_events = epoll::wait(epoll_fd, -1, &mut epoll_buffer)?;
 
-        //map and simulate events, dealing with
-        'events: for event in &epoll_buffer[0..num_events] {
+        // Map and simulate events
+        'inner_loop: for event in &epoll_buffer[0..num_events] {
             if cancel_flag.load(Ordering::SeqCst) {
-                break 'event_loop;
+                break 'outer_loop;
             }
 
             // new device file created
@@ -379,31 +548,82 @@ where
                         event.mask.contains(inotify::EventMask::CREATE),
                         "inotify is listening for events other than file creation"
                     );
-                    add_device_to_epoll_from_inotify_event(epoll_fd, event, &mut devices)?;
+                    // add_device_to_epoll_from_inotify_event(epoll_fd, event, &mut devices)?;
                 }
+                // TODO: add_device_to_epoll_from_inotify_event
+                panic!("TODO: add_device_to_epoll_from_inotify_event");
             } else {
                 // Input device recieved event
                 let device_idx = event.data as usize;
-                let device = devices.get(device_idx).unwrap();
-                while device.has_event_pending() {
+
+                let Some(mut device) = devices.get(device_idx) else {
+                    println!("Cannot get device at index: {}", device_idx);
+                    thread::sleep(Duration::from_millis(1000));
+                    continue;
+                };
+
+                let ev_device = &device.ev_device;
+
+                while ev_device.has_event_pending() {
                     //TODO: deal with EV_SYN::SYN_DROPPED
-                    let (_, event) = match device.next_event(evdev_rs::ReadFlag::NORMAL) {
+                    let (_, event) = match ev_device.next_event(evdev_rs::ReadFlag::NORMAL) {
                         Ok(event) => event,
                         Err(_) => {
-                            let device_fd = device.file().as_raw_fd();
+                            let device_fd = ev_device.file().as_raw_fd();
                             let empty_event = epoll::Event::new(epoll::Events::empty(), 0);
                             epoll::ctl(epoll_fd, EPOLL_CTL_DEL, device_fd, empty_event)?;
-                            continue 'events;
+                            continue 'inner_loop;
                         }
                     };
-                    let (event, grab_status) = func(event);
 
-                    if let (Some(event), Some(out_device)) = (event, output_devices.get(device_idx))
-                    {
+                    // if let DeviceType::Touchpad(mut current, mut previous) = device.device_type {
+                    //     previous = current.clone();
+                    //     let mut slot: Option<usize> = None;
+                    //     let mut down: Option<bool> = None;
+                    //     let mut x: Option<i32> = None;
+                    //     let mut y: Option<i32> = None;
+                    //     if let Some(current) = current {
+                    //         if let Some(slot) = current.slot {
+                    //             down = current.down.get(slot).cloned();
+                    //         }
+                    //         if let Some(point) = current.point.get(slot) {
+                    //             (x, y) = (Some(point.x), Some(point.y));
+                    //         }
+                    //     }
+                    //     match event.event_code {
+                    //         EventCode::EV_KEY(EV_KEY::BTN_TOUCH) => {
+                    //             down = Some(event.value == 1);
+                    //         }
+                    //         EventCode::EV_ABS(EV_ABS::ABS_MT_SLOT) => {
+                    //             slot = Some(event.value.unsigned_abs() as usize);
+                    //         }
+                    //         EventCode::EV_ABS(EV_ABS::ABS_MT_POSITION_X) => {
+                    //             x = Some(event.value);
+                    //         }
+                    //         EventCode::EV_ABS(EV_ABS::ABS_MT_POSITION_Y) => {
+                    //             y = Some(event.value);
+                    //         }
+                    //         _ => {}
+                    //     }
+
+                    //     // device.device_type = DeviceType::Touchpad(current, previous);
+                    // }
+
+                    // println!(
+                    //     "EVENT: {:?}, {:?}, {:}: {}",
+                    //     ev_device,
+                    //     event.event_type(),
+                    //     event.event_code,
+                    //     event.value
+                    // );
+
+                    let (event, grab_status) = callback(event, device);
+
+                    if let (Some(event), out_device) = (event, &device.output_device) {
                         out_device.write_event(&event)?;
                     }
                     if grab_status == GrabStatus::Stop {
-                        break 'event_loop;
+                        break 'outer_loop;
                     }
                 }
             }
@@ -412,7 +632,7 @@ where
 
     for device in devices.iter_mut() {
         //ungrab devices, ignore errors
-        device.grab(evdev_rs::GrabMode::Ungrab).ok();
+        device.ev_device.grab(evdev_rs::GrabMode::Ungrab).ok();
     }
 
     epoll::close(epoll_fd)?;
@@ -420,7 +640,7 @@ where
 }
 
 static DEV_PATH: &str = "/dev/input";
-const INOTIFY_DATA: u64 = u64::max_value();
+const INOTIFY_DATA: u64 = u64::MAX;
 const EPOLLIN: epoll::Events = epoll::Events::EPOLLIN;
 
 /// Whether to continue grabbing events or to stop
@@ -431,43 +651,6 @@ pub enum GrabStatus {
     Continue,
     /// ungrab events
     Stop,
-}
-
-fn get_device_files<T>(path: T) -> io::Result<Vec<File>>
-where
-    T: AsRef<Path>,
-{
-    let mut res = Vec::new();
-    for entry in read_dir(path)? {
-        let entry = entry?;
-        // /dev/input files are character devices
-        if !entry.file_type()?.is_char_device() {
-            continue;
-        }
-
-        let path = entry.path();
-        let file_name_bytes = match path.file_name() {
-            Some(file_name) => file_name.as_bytes(),
-            None => continue, // file_name was "..", should be impossible
-        };
-        // skip filenames matching "mouse.* or mice".
-        // these files don't play nice with libevdev, not sure why
-        // see: https://askubuntu.com/questions/1043832/difference-between-dev-input-mouse0-and-dev-input-mice
-        if file_name_bytes == OsStr::new("mice").as_bytes()
-            || file_name_bytes
-                .get(0..=1)
-                .map(|s| s == OsStr::new("js").as_bytes())
-                .unwrap_or(false)
-            || file_name_bytes
-                .get(0..=4)
-                .map(|s| s == OsStr::new("mouse").as_bytes())
-                .unwrap_or(false)
-        {
-            continue;
-        }
-        res.push(File::open(path)?);
-    }
-    Ok(res)
 }
 
 fn epoll_watch_all<'a, T>(device_files: T) -> io::Result<RawFd>
@@ -483,51 +666,152 @@ where
     Ok(epoll_fd)
 }
 
-fn inotify_devices() -> io::Result<Inotify> {
+fn inotify_devices(device_paths: Vec<PathBuf>) -> io::Result<Inotify> {
     let inotify = Inotify::init()?;
-    inotify.watches().add(DEV_PATH, WatchMask::CREATE)?;
+    for path in device_paths {
+        println!("adding inotify watch for path: {:?}", path);
+        inotify.watches().add(path, WatchMask::CREATE)?;
+    }
     Ok(inotify)
 }
 
-fn add_device_to_epoll_from_inotify_event(
-    epoll_fd: RawFd,
-    event: inotify::Event<&OsStr>,
-    devices: &mut Vec<Device>,
-) -> io::Result<()> {
-    let mut device_path = OsString::from(DEV_PATH);
-    device_path.push(OsString::from("/"));
-    device_path.push(event.name.unwrap());
-    // new plug events
-    let file = File::open(device_path)?;
-    let fd = file.as_raw_fd();
-    let device = Device::new_from_file(file)?;
-    let event = epoll::Event::new(EPOLLIN, devices.len() as u64);
-    devices.push(device);
-    epoll::ctl(epoll_fd, EPOLL_CTL_ADD, fd, event)?;
-    Ok(())
+// fn add_device_to_epoll_from_inotify_event(
+//     epoll_fd: RawFd,
+//     event: inotify::Event<&OsStr>,
+//     devices: &mut Vec<Device>,
+// ) -> io::Result<()> {
+//     let mut device_path = OsString::from(DEV_PATH);
+//     device_path.push(OsString::from("/"));
+//     device_path.push(event.name.unwrap());
+//     // new plug events
+//     let file = File::open(device_path)?;
+//     let fd = file.as_raw_fd();
+//     let device = EVDevice::new_from_file(file)?;
+//     let event = epoll::Event::new(EPOLLIN, devices.len() as u64);
+//     devices.push(device);
+//     epoll::ctl(epoll_fd, EPOLL_CTL_ADD, fd, event)?;
+//     Ok(())
+// }
+
+#[derive(Debug)]
+pub struct Device {
+    pub device_type: DeviceType,
+    pub ev_device: EVDevice,
+    pub file: File,
+    pub path: PathBuf,
+    pub output_device: UInputDevice,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum DeviceType {
+    Keyboard,
+    Mouse,
+    Touchpad,
+    LidSwitch,
+}
+
+impl DeviceType {
+    fn event_code(&self) -> EventCode {
+        match self {
+            DeviceType::Keyboard => EventCode::EV_KEY(EV_KEY::KEY_LEFTMETA),
+            DeviceType::Mouse => EventCode::EV_REL(EV_REL::REL_WHEEL),
+            DeviceType::Touchpad => EventCode::EV_ABS(EV_ABS::ABS_MT_POSITION_Y),
+            DeviceType::LidSwitch => EventCode::EV_SW(EV_SW::SW_LID),
+        }
+    }
 }
 
 /// Returns tuple of epoll_fd, all devices, and uinput devices, where
 /// uinputdevices is the same length as devices, and each uinput device is
 /// a libevdev copy of its corresponding device.The epoll_fd is level-triggered
 /// on any available data in the original devices.
-fn setup_devices() -> io::Result<(RawFd, Vec<Device>, Vec<UInputDevice>)> {
-    let device_files = get_device_files(DEV_PATH)?;
-    let epoll_fd = epoll_watch_all(device_files.iter())?;
-    let devices = device_files
-        .into_iter()
-        .map(Device::new_from_file)
-        .collect::<io::Result<Vec<Device>>>()?;
-    let output_devices = devices
-        .iter()
-        .map(UInputDevice::create_from_device)
-        .collect::<io::Result<Vec<UInputDevice>>>()?;
-    Ok((epoll_fd, devices, output_devices))
+fn setup_devices() -> io::Result<(RawFd, Vec<Device>)> {
+    // let device_files_and_paths = get_device_files_and_paths(DEV_PATH)?;
+
+    let mut devices = Vec::<Device>::new();
+
+    let mut device_types = HashMap::<&str, DeviceType>::new();
+    device_types.insert(
+        "Framework Laptop 16 Keyboard Module - ANSI Keyboard",
+        DeviceType::Keyboard,
+    );
+    device_types.insert(
+        "Apple Inc. Magic Keyboard with Numeric Keypad",
+        DeviceType::Keyboard,
+    );
+    device_types.insert("Logitech MX Master 3S", DeviceType::Mouse);
+    device_types.insert("Lid Switch", DeviceType::LidSwitch);
+    device_types.insert("Touchpad", DeviceType::Touchpad);
+
+    for entry in read_dir(DEV_PATH)? {
+        let entry = entry?;
+        // /dev/input files are character devices
+        if !entry.file_type()?.is_char_device() {
+            continue;
+        }
+
+        let path = entry.path();
+        let file_name_bytes = match path.file_name() {
+            Some(file_name) => file_name.as_bytes(),
+            None => continue, // file_name was "..", should be impossible
+        };
+
+        // skip filenames matching "mouse.* or mice".
+        // these files don't play nice with libevdev, not sure why
+        // see: https://askubuntu.com/questions/1043832/difference-between-dev-input-mouse0-and-dev-input-mice
+        if file_name_bytes == OsStr::new("mice").as_bytes()
+            || file_name_bytes
+                .get(0..=1)
+                .map(|s| s == OsStr::new("js").as_bytes())
+                .unwrap_or(false)
+            || file_name_bytes
+                .get(0..=4)
+                .map(|s| s == OsStr::new("mouse").as_bytes())
+                .unwrap_or(false)
+        {
+            continue;
+        }
+
+        let file = File::open(&path)?;
+        let device_file = file.try_clone()?;
+
+        let ev_device = EVDevice::new_from_file(device_file)?;
+
+        println!("DEVICE: {:?}", ev_device);
+
+        let device_name = ev_device.name().unwrap_or_default();
+
+        let Some(device_type) = device_types
+            .iter()
+            .find(|(&name, device_type)| {
+                device_name.contains(name) && ev_device.has_event_code(&device_type.event_code())
+            })
+            .map(|(_, &device_type)| device_type)
+        else {
+            continue;
+        };
+
+        println!("INCLUDE DEVICE: {:?}", ev_device);
+
+        let output_device = UInputDevice::create_from_device(&ev_device)?;
+
+        devices.push(Device {
+            device_type,
+            ev_device,
+            file,
+            path,
+            output_device,
+        });
+    }
+
+    let epoll_fd = epoll_watch_all(devices.iter().map(|dev| &dev.file))?;
+
+    Ok((epoll_fd, devices))
 }
 
 /// Creates an inotify instance looking at /dev/input and adds it to an epoll instance.
 /// Ensures devices isnt too long, which would make the epoll data ambigious.
-fn setup_inotify(epoll_fd: RawFd, devices: &[Device]) -> io::Result<Inotify> {
+fn setup_inotify(epoll_fd: RawFd, devices: &Vec<Device>) -> io::Result<Inotify> {
     //Ensure there is space for inotify at last epoll index.
     if devices.len() as u64 >= INOTIFY_DATA {
         eprintln!("number of devices: {}", devices.len());
@@ -537,7 +821,7 @@ fn setup_inotify(epoll_fd: RawFd, devices: &[Device]) -> io::Result<Inotify> {
         ));
     }
     // Set up inotify to listen for new devices being plugged in
-    let inotify = inotify_devices()?;
+    let inotify = inotify_devices(devices.iter().map(|dev| dev.path.clone()).collect())?;
     let epoll_event = epoll::Event::new(EPOLLIN, INOTIFY_DATA);
     epoll::ctl(epoll_fd, EPOLL_CTL_ADD, inotify.as_raw_fd(), epoll_event)?;
     Ok(inotify)

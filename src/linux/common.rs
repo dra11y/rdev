@@ -67,7 +67,7 @@ pub fn convert(
     Some(Event {
         event_type,
         time: SystemTime::now(),
-        name,
+        char: name,
     })
 }
 

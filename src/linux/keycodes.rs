@@ -28,7 +28,7 @@ macro_rules! decl_keycodes {
 
 #[rustfmt::skip]
 decl_keycodes!(
-    Alt, 64,
+    AltLeft, 64,
     AltGr, 108,
     Backspace, 22,
     CapsLock, 66,
