@@ -1,5 +1,4 @@
 use std::collections::HashMap;
-use std::default;
 
 use crate::rdev::{Direction, Fingers, Gesture};
 
@@ -20,7 +19,6 @@ const INITIAL_SLOTS: usize = 5;
 const EVENT_TIMEOUT: f64 = 10_593_665_152f64;
 /// A new gesture (note: not a new report) will not be entertained in this timespan.
 const DEBOUNCE_TIME: f64 = 0.2f64;
-const SCROLL_DEBOUNCE_TIME: f64 = 0.05f64;
 
 #[derive(Clone, Debug, Default)]
 struct Position {

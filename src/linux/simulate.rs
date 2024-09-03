@@ -35,20 +35,8 @@ unsafe fn send_native(event_type: &EventType, display: *mut xlib::Display) -> Op
         },
         EventType::MouseMove { x, y } => {
             //TODO: replace with clamp if it is stabalized
-            let x = if x.is_finite() {
-                x.min(c_int::max_value().into())
-                    .max(c_int::min_value().into())
-                    .round() as c_int
-            } else {
-                0
-            };
-            let y = if y.is_finite() {
-                y.min(c_int::max_value().into())
-                    .max(c_int::min_value().into())
-                    .round() as c_int
-            } else {
-                0
-            };
+            let x = *x.clamp(&c_int::MIN, &c_int::MAX) as c_int;
+            let y = *y.clamp(&c_int::MIN, &c_int::MAX) as c_int;
             xtest::XTestFakeMotionEvent(display, 0, x, y, 0)
             //     xlib::XWarpPointer(display, 0, root, 0, 0, 0, 0, *x as i32, *y as i32);
         }
@@ -69,7 +57,36 @@ unsafe fn send_native(event_type: &EventType, display: *mut xlib::Display) -> Op
             }
             result
         }
-        EventType::Touch(touch_event) => todo!("EventType::TouchPad(Touch)"),
+        EventType::WheelHires { delta_x, delta_y } => {
+            println!(
+                "TODO! Simulate EventType::WheelHires({}, {})",
+                delta_x, delta_y
+            );
+            // let code_x = if *delta_x > 0 { 7 } else { 6 };
+            // let code_y = if *delta_y > 0 { 4 } else { 5 };
+
+            // let mut result: c_int = 1;
+            // for _ in 0..delta_x.abs() {
+            //     result = result
+            //         & xtest::XTestFakeButtonEvent(display, code_x, TRUE, 0)
+            //         & xtest::XTestFakeButtonEvent(display, code_x, FALSE, 0)
+            // }
+            // for _ in 0..delta_y.abs() {
+            //     result = result
+            //         & xtest::XTestFakeButtonEvent(display, code_y, TRUE, 0)
+            //         & xtest::XTestFakeButtonEvent(display, code_y, FALSE, 0)
+            // }
+            // result
+            -1
+        }
+        EventType::Touch(gesture) => {
+            println!("TODO! Simulate EventType::TouchPad({:?})", gesture);
+            -1
+        }
+        EventType::LidSwitch(value) => {
+            println!("TODO! Simulate EventType::LidSwitch({})", value);
+            -1
+        }
     };
     if res == 0 {
         None

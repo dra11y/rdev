@@ -255,7 +255,7 @@ pub enum Direction {
 }
 
 #[repr(u8)]
-#[derive(Clone, Debug, PartialEq, PartialOrd, Copy, Eq, Ord)]
+#[derive(Clone, Debug, Hash, PartialEq, PartialOrd, Copy, Eq, Ord)]
 pub enum Fingers {
     One = 1,
     Two = 2,
@@ -264,7 +264,7 @@ pub enum Fingers {
 }
 
 /// A result derived from one or more [`SynReport`] instances in a stream.
-#[derive(Clone, Copy, Debug, PartialEq, PartialOrd, Eq, Ord)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, PartialOrd, Ord)]
 pub enum Gesture {
     Tap {
         fingers: Fingers,
@@ -283,7 +283,7 @@ pub enum Gesture {
 
 /// In order to manage different OSs, the current EventType choices are a mix and
 /// match to account for all possible events.
-#[derive(Debug, Copy, Clone, PartialEq)]
+#[derive(Debug, Copy, Clone, Eq, Hash, PartialEq)]
 #[cfg_attr(feature = "serialize", derive(Serialize, Deserialize))]
 pub enum EventType {
     /// The keys correspond to a standard qwerty layout, they don't correspond
@@ -295,18 +295,24 @@ pub enum EventType {
     ButtonRelease(Button),
     /// Touch events
     Touch(Gesture),
+    /// Laptop lid open/close
+    LidSwitch(i32),
     /// Values in pixels. `EventType::MouseMove{x: 0, y: 0}` corresponds to the
     /// top left corner, with x increasing downward and y increasing rightward
     MouseMove {
-        x: f64,
-        y: f64,
+        x: i32,
+        y: i32,
     },
     /// `delta_y` represents vertical scroll and `delta_x` represents horizontal scroll.
     /// Positive values correspond to scrolling up or right and negative values
     /// correspond to scrolling down or left
     Wheel {
-        delta_x: i64,
-        delta_y: i64,
+        delta_x: i32,
+        delta_y: i32,
+    },
+    WheelHires {
+        delta_x: i32,
+        delta_y: i32,
     },
 }
 

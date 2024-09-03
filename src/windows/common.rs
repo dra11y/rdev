@@ -85,13 +85,13 @@ pub unsafe fn convert(param: WPARAM, lpdata: LPARAM) -> Option<EventType> {
             let delta = get_delta(lpdata) as c_short;
             Some(EventType::Wheel {
                 delta_x: 0,
-                delta_y: (delta / WHEEL_DELTA) as i64,
+                delta_y: (delta / WHEEL_DELTA),
             })
         }
         Ok(WM_MOUSEHWHEEL) => {
             let delta = get_delta(lpdata) as c_short;
             Some(EventType::Wheel {
-                delta_x: (delta / WHEEL_DELTA) as i64,
+                delta_x: (delta / WHEEL_DELTA),
                 delta_y: 0,
             })
         }

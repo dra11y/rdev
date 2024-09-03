@@ -1,5 +1,5 @@
+use better_rdev::{listen, simulate, Button, Event, EventType, Key};
 use lazy_static::lazy_static;
-use rdev::{listen, simulate, Button, Event, EventType, Key};
 use serial_test::serial;
 use std::error::Error;
 use std::iter::Iterator;

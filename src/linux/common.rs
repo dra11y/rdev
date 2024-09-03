@@ -10,7 +10,7 @@ use x11::xlib;
 pub const TRUE: c_int = 1;
 pub const FALSE: c_int = 0;
 
-pub fn convert_event(code: c_uchar, type_: c_int, x: f64, y: f64) -> Option<EventType> {
+pub fn convert_event(code: c_uchar, type_: c_int, x: i32, y: i32) -> Option<EventType> {
     match type_ {
         xlib::KeyPress => {
             let key = key_from_code(code.into());
@@ -58,8 +58,8 @@ pub fn convert(
     keyboard: &mut Option<Keyboard>,
     code: c_uint,
     type_: c_int,
-    x: f64,
-    y: f64,
+    x: i32,
+    y: i32,
 ) -> Option<Event> {
     let event_type = convert_event(code as c_uchar, type_, x, y)?;
     let kb: &mut Keyboard = (*keyboard).as_mut()?;

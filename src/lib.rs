@@ -1,3 +1,5 @@
+#![allow(unused, dead_code)]
+
 //! Simple library to listen and send events to keyboard and mouse on MacOS, Windows and Linux
 //! (x11).
 //!
@@ -223,6 +225,8 @@ pub use crate::rdev::{
     KeyboardState, ListenError, SimulateError,
 };
 
+use std::sync::mpsc::Receiver;
+
 #[cfg(target_os = "macos")]
 mod macos;
 #[cfg(target_os = "macos")]
@@ -362,11 +366,11 @@ pub use evdev_rs::Device;
 /// }
 /// ```
 #[cfg(feature = "unstable_grab")]
-pub fn grab<T>(callback: T, cancel_flag: Arc<AtomicBool>) -> Result<(), GrabError>
+pub fn grab<T>(callback: T, cancel_rx: &Receiver<()>) -> Result<(), GrabError>
 where
     T: Fn(Event, &Device) -> GrabReturn + 'static,
 {
-    _grab(callback, cancel_flag)
+    _grab(callback, cancel_rx)
 }
 
 #[cfg(test)]

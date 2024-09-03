@@ -19,6 +19,7 @@ use std::os::unix::{
     io::{AsRawFd, RawFd},
 };
 use std::path::PathBuf;
+use std::sync::mpsc::Receiver;
 use std::sync::Mutex;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
@@ -202,10 +203,10 @@ convert_keys!(
 fn evdev_event_to_rdev_event(
     event: &InputEvent,
     device: &Device,
-    x: &mut f64,
-    y: &mut f64,
-    w: f64,
-    h: f64,
+    x: &mut i32,
+    y: &mut i32,
+    w: i32,
+    h: i32,
 ) -> Option<EventType> {
     let event_type = match &device.device_type {
         DeviceType::Keyboard => match &event.event_code {
@@ -228,10 +229,10 @@ fn evdev_event_to_rdev_event(
             },
             EventCode::EV_REL(mouse) => match mouse {
                 EV_REL::REL_X => {
-                    let dx = event.value as f64;
+                    let dx = event.value;
                     *x += dx;
-                    if *x < 0.0 {
-                        *x = 0.0;
+                    if *x < 0 {
+                        *x = 0;
                     }
                     if *x > w {
                         *x = w;
@@ -239,10 +240,10 @@ fn evdev_event_to_rdev_event(
                     Some(EventType::MouseMove { x: *x, y: *y })
                 }
                 EV_REL::REL_Y => {
-                    let dy = event.value as f64;
+                    let dy = event.value;
                     *y += dy;
-                    if *y < 0.0 {
-                        *y = 0.0;
+                    if *y < 0 {
+                        *y = 0;
                     }
                     if *y > h {
                         *y = h;
@@ -250,12 +251,20 @@ fn evdev_event_to_rdev_event(
                     Some(EventType::MouseMove { x: *x, y: *y })
                 }
                 EV_REL::REL_HWHEEL => Some(EventType::Wheel {
-                    delta_x: event.value.into(),
+                    delta_x: event.value,
+                    delta_y: 0,
+                }),
+                EV_REL::REL_HWHEEL_HI_RES => Some(EventType::WheelHires {
+                    delta_x: event.value,
                     delta_y: 0,
                 }),
                 EV_REL::REL_WHEEL => Some(EventType::Wheel {
                     delta_x: 0,
-                    delta_y: event.value.into(),
+                    delta_y: event.value,
+                }),
+                EV_REL::REL_WHEEL_HI_RES => Some(EventType::WheelHires {
+                    delta_x: 0,
+                    delta_y: event.value,
                 }),
                 _ => None,
             },
@@ -315,7 +324,10 @@ fn evdev_event_to_rdev_event(
         //     },
         //     _ => None,
         // },
-        DeviceType::LidSwitch => todo!(),
+        DeviceType::LidSwitch => {
+            println!("DeviceType::LidSwitch value: {}", event.value);
+            Some(EventType::LidSwitch(event.value))
+        }
     };
 
     if event_type.is_none() {
@@ -394,7 +406,7 @@ fn evdev_event_to_rdev_event(
 
 pub type GrabReturn = (Option<Event>, GrabStatus);
 
-pub fn grab<T>(callback: T, cancel_flag: Arc<AtomicBool>) -> Result<(), GrabError>
+pub fn grab<T>(callback: T, cancel_rx: &Receiver<()>) -> Result<(), GrabError>
 where
     T: Fn(Event, &EVDevice) -> GrabReturn + 'static,
 {
@@ -404,14 +416,14 @@ where
     let (current_x, current_y) = display
         .get_mouse_pos()
         .ok_or(GrabError::MissingDisplayError)?;
-    let mut x = current_x as f64;
-    let mut y = current_y as f64;
-    let w = width as f64;
-    let h = height as f64;
+    let mut x = current_x as i32;
+    let mut y = current_y as i32;
+    let w = width as i32;
+    let h = height as i32;
 
     let mut touch_event_loop = Arc::new(Mutex::new(TouchEventLoop::new()));
 
-    filter_map_events(cancel_flag, move |event, device| {
+    filter_map_events(cancel_rx, move |event, device| {
         let mut touch_event_loop = touch_event_loop
             .lock()
             .expect("Failed to lock touch_event_loop Mutex");
@@ -480,7 +492,7 @@ where
 fn force_release_keys(output_device: &UInputDevice) {
     println!("force_release_keys output_device: {:?}", output_device);
 
-    sleep(Duration::from_millis(50));
+    sleep(Duration::from_millis(10));
 
     let keys = [
         EV_KEY::KEY_LEFTMETA,
@@ -496,7 +508,7 @@ fn force_release_keys(output_device: &UInputDevice) {
 
     for key in keys.iter() {
         let event = InputEvent::new(&evdev_rs::TimeVal::new(0, 0), &EventCode::EV_KEY(*key), 0);
-        sleep(Duration::from_millis(50));
+        sleep(Duration::from_millis(10));
         output_device.write_event(&event).ok();
         output_device
             .write_event(&InputEvent::new(
@@ -508,7 +520,7 @@ fn force_release_keys(output_device: &UInputDevice) {
     }
 }
 
-pub fn filter_map_events<F>(cancel_flag: Arc<AtomicBool>, mut callback: F) -> io::Result<()>
+pub fn filter_map_events<F>(cancel_rx: &Receiver<()>, mut callback: F) -> io::Result<()>
 where
     F: FnMut(InputEvent, &Device) -> (Option<InputEvent>, GrabStatus),
 {
@@ -519,6 +531,7 @@ where
     // let output_devices: Vec<UInputDevice> = devices.iter().map(|dev| dev.output_device).collect();
 
     for device in &mut devices {
+        // force_release_keys(&device.output_device);
         device.ev_device.grab(GrabMode::Grab)?;
     }
 
@@ -529,17 +542,25 @@ where
     let mut inotify_buffer = vec![0_u8; 4096];
 
     'outer_loop: loop {
-        if cancel_flag.load(Ordering::SeqCst) {
-            break 'outer_loop;
-        }
+        match cancel_rx.try_recv() {
+            Ok(_) => break 'outer_loop,
+            Err(error) => match error {
+                std::sync::mpsc::TryRecvError::Empty => (),
+                std::sync::mpsc::TryRecvError::Disconnected => break 'outer_loop,
+            },
+        };
 
         let num_events = epoll::wait(epoll_fd, -1, &mut epoll_buffer)?;
 
         // Map and simulate events
         'inner_loop: for event in &epoll_buffer[0..num_events] {
-            if cancel_flag.load(Ordering::SeqCst) {
-                break 'outer_loop;
-            }
+            match cancel_rx.try_recv() {
+                Ok(_) => break 'outer_loop,
+                Err(error) => match error {
+                    std::sync::mpsc::TryRecvError::Empty => (),
+                    std::sync::mpsc::TryRecvError::Disconnected => break 'outer_loop,
+                },
+            };
 
             // new device file created
             if event.data == INOTIFY_DATA {
@@ -777,7 +798,7 @@ fn setup_devices() -> io::Result<(RawFd, Vec<Device>)> {
 
         let ev_device = EVDevice::new_from_file(device_file)?;
 
-        println!("DEVICE: {:?}", ev_device);
+        // println!("DEVICE: {:?}", ev_device);
 
         let device_name = ev_device.name().unwrap_or_default();
 
@@ -791,7 +812,7 @@ fn setup_devices() -> io::Result<(RawFd, Vec<Device>)> {
             continue;
         };
 
-        println!("INCLUDE DEVICE: {:?}", ev_device);
+        // println!("INCLUDE DEVICE: {:?}", ev_device);
 
         let output_device = UInputDevice::create_from_device(&ev_device)?;
 

@@ -126,8 +126,8 @@ unsafe extern "C" fn record_callback(
     let code: c_uint = xdatum.code.into();
     let type_: c_int = xdatum.type_.into();
 
-    let x = xdatum.root_x as f64;
-    let y = xdatum.root_y as f64;
+    let x = xdatum.root_x as i32;
+    let y = xdatum.root_y as i32;
 
     let recorder = &mut *(raw_data as *mut Recorder);
 
